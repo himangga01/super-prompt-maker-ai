@@ -1,0 +1,14 @@
+{
+  "name": "super-prompt-maker",
+  "version": "1.0.0",
+  "description": "서비스별 최적 프롬프트 생성기 - 접속자 본인의 Claude/Codex/Gemini CLI 계정으로 동작하는 로컬 웹서비스",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test",
+    "test:cli": "node tests/run-cli.mjs",
+    "bridge": "node public/spm-bridge.mjs"
+  }
+}
