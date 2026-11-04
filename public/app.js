@@ -2,15 +2,30 @@ const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const CLI_NAMES = { claude: 'Claude CLI', codex: 'Codex CLI', gemini: 'Gemini CLI', template: '기본 엔진' };
+const CLIS = ['claude', 'codex', 'gemini'];
+const ENGINES = [...CLIS, 'template'];
+// How to log in to each CLI again (matches README).
+const LOGIN_CMD = { claude: 'claude auth login', codex: 'codex login', gemini: 'gemini' };
 
-const state = { catalog: null, session: null, engine: { enhance: null, build: null }, pairTimer: null };
+// engine: what each form will use now; chosen: what the user explicitly picked (kept while that CLI is briefly offline).
+const state = { catalog: null, session: null, engine: { enhance: null, build: null }, chosen: { enhance: null, build: null }, pairTimer: null };
 
 async function api(path, { method = 'GET', body } = {}) {
-  const res = await fetch(path, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  let res;
+  try {
+    // The server takes only JSON for anything but GET (CSRF guard), so DELETE sends an empty JSON body too.
+    const json = method !== 'GET';
+    res = await fetch(path, { method, headers: json ? { 'content-type': 'application/json' } : {}, body: json ? JSON.stringify(body ?? {}) : undefined });
+  } catch {
+    throw Object.assign(new Error('서버에 연결할 수 없습니다. 네트워크 연결을 확인하세요.'), { network: true });
+  }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `요청 실패 (${res.status})`);
+  if (!res.ok) throw Object.assign(new Error(data.error || `요청 실패 (${res.status})`), { status: res.status });
   return data;
 }
+
+// Background actions (save, favorite, delete…) have no error box of their own; surface failures as a toast.
+window.addEventListener('unhandledrejection', (e) => toast(e.reason?.message || '요청에 실패했습니다'));
 
 function toast(msg) {
   const t = $('#toast');
@@ -25,15 +40,18 @@ async function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
     else {
       // http://<LAN-IP> is not a secure context, so fall back to execCommand.
-      const ta = Object.assign(document.createElement('textarea'), { value: text });
-      ta.style.cssText = 'position:fixed;opacity:0';
+      // readonly + 16px keeps iOS from opening the keyboard or zooming; setSelectionRange is what iOS honors.
+      const ta = Object.assign(document.createElement('textarea'), { value: text, readOnly: true });
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px';
       document.body.append(ta);
       ta.select();
-      document.execCommand('copy');
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy');
       ta.remove();
+      if (!ok) throw new Error('copy refused');
     }
     toast('📋 복사했습니다');
-  } catch { toast('복사에 실패했습니다'); }
+  } catch { toast('복사하지 못했습니다. 프롬프트를 길게 눌러 직접 복사하세요'); }
 }
 
 const targetName = (id) => state.catalog.TARGETS.find((t) => t.id === id)?.name || id;
@@ -41,7 +59,7 @@ const timeText = (iso) => new Date(iso).toLocaleString('ko-KR', { month: 'short'
 
 // ---------------- tabs ----------------
 function go(tab) {
-  $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  $$('.tab').forEach((b) => { b.classList.toggle('active', b.dataset.tab === tab); b.setAttribute('aria-selected', String(b.dataset.tab === tab)); });
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${tab}`));
   if (tab === 'history') loadHistory();
   if (tab === 'library') loadLibrary();
@@ -60,24 +78,31 @@ const DEFAULTS = {
   build: { targets: ['chatgpt'], techniques: ['examples'], role: 'marketer', task: 'write', goal: 'inform', tone: 'professional', format: 'auto', length: 'medium', lang: 'ko' },
 };
 
+// Keeps the visual state and the screen-reader state of chips in step.
+const setChip = (c, on) => { c.classList.toggle('on', on); c.setAttribute('aria-pressed', String(on)); };
+
 function setupForm(form, kind) {
   for (const box of $$('[data-chips]', form)) {
     const key = box.dataset.chips;
     const multi = Number(box.dataset.multi || 1);
     const list = state.catalog[CHIP_SOURCES[key]].map((o) => ({ id: o.id, label: o.label || o.name }));
+    box.setAttribute('role', 'group');
+    box.setAttribute('aria-label', box.closest('.field')?.querySelector('span')?.textContent.trim() || key);
     box.innerHTML = list.map((o) => `<button type="button" class="chip" data-id="${o.id}">${esc(o.label)}</button>`).join('');
     const pick = new Set(DEFAULTS[kind][key] || []);
-    $$('.chip', box).forEach((c) => c.classList.toggle('on', pick.has(c.dataset.id)));
+    $$('.chip', box).forEach((c) => setChip(c, pick.has(c.dataset.id)));
     box.addEventListener('click', (e) => {
       const c = e.target.closest('.chip');
       if (!c) return;
       const on = $$('.chip.on', box);
-      if (multi === 1 && key !== 'techniques') { on.forEach((x) => x.classList.remove('on')); c.classList.add('on'); return; }
+      if (multi === 1 && key !== 'techniques') { on.forEach((x) => setChip(x, false)); setChip(c, true); return; }
       if (!c.classList.contains('on') && on.length >= multi) { toast(`최대 ${multi}개까지 선택할 수 있습니다`); return; }
-      c.classList.toggle('on');
-      if (key !== 'techniques' && !$('.chip.on', box)) c.classList.add('on');
+      setChip(c, !c.classList.contains('on'));
+      if (key !== 'techniques' && !$('.chip.on', box)) setChip(c, true);
     });
   }
+  // Enter in a one-line field would submit the form and start a (token-spending) generation.
+  form.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('input')) e.preventDefault(); });
   for (const sel of $$('select[data-select]', form)) {
     const list = state.catalog[sel.dataset.select];
     const optional = kind === 'enhance' || sel.hasAttribute('data-optional');
@@ -104,11 +129,12 @@ function collect(form, kind) {
 
 function fillForm(form, kind, req) {
   for (const [k, val] of Object.entries(req.options || {})) {
-    const el = form.elements[k];
+    // namedItem, not elements[k]: elements.length is the collection's own count, not <select name="length">.
+    const el = form.elements.namedItem(k);
     if (el && typeof val === 'string') el.value = val;
   }
-  if (form.elements.input) form.elements.input.value = req.input || '';
-  const mark = (key, ids) => $$(`[data-chips="${key}"] .chip`, form).forEach((c) => c.classList.toggle('on', ids.includes(c.dataset.id)));
+  if (form.elements.namedItem('input')) form.elements.namedItem('input').value = req.input || '';
+  const mark = (key, ids) => $$(`[data-chips="${key}"] .chip`, form).forEach((c) => setChip(c, ids.includes(c.dataset.id)));
   mark('targets', req.targets || []);
   if (kind === 'enhance') mark('purpose', [req.purpose || 'general']);
   mark('techniques', req.options?.techniques || []);
@@ -123,25 +149,34 @@ function engineAvailability(p) {
   return null;
 }
 
+// Recomputed on every render, so a CLI that comes back (or a session that loads late) is picked up again.
+function pickEngine(kind, avail) {
+  const ok = (p) => p === 'template' || avail[p];
+  if (state.chosen[kind] && ok(state.chosen[kind])) return state.chosen[kind];
+  let last = null;
+  try { last = localStorage.getItem('spm_engine'); } catch { /* storage blocked */ }
+  if (last && ok(last)) return last;
+  return CLIS.find((p) => avail[p]) || 'template';
+}
+
 function renderEngines() {
   for (const kind of ['enhance', 'build']) {
     const box = $(`#${kind}Form [data-engine]`);
-    const avail = Object.fromEntries(['claude', 'codex', 'gemini'].map((p) => [p, engineAvailability(p)]));
-    if (!state.engine[kind] || (state.engine[kind] !== 'template' && !avail[state.engine[kind]])) {
-      let last = null;
-      try { last = localStorage.getItem('spm_engine'); } catch { /* storage blocked */ }
-      state.engine[kind] = (last && (last === 'template' || avail[last]) && last) || ['claude', 'codex', 'gemini'].find((p) => avail[p]) || 'template';
-    }
-    box.innerHTML = `<div class="engine-title">생성 엔진 <small>${avail.claude || avail.codex || avail.gemini ? '내 계정 토큰으로 실행' : '<a href="#connect" data-go="connect">AI 연결하기 →</a>'}</small></div>
-      <div class="engine-opts">${['claude', 'codex', 'gemini', 'template'].map((p) => {
+    const avail = Object.fromEntries(CLIS.map((p) => [p, engineAvailability(p)]));
+    state.engine[kind] = pickEngine(kind, avail);
+    const html = `<div class="engine-title">생성 엔진 <small>${avail.claude || avail.codex || avail.gemini ? '내 계정 토큰으로 실행' : '<a href="#connect" data-go="connect">AI 연결하기 →</a>'}</small></div>
+      <div class="engine-opts" role="group" aria-label="생성 엔진">${ENGINES.map((p) => {
         const a = p === 'template' ? { label: '오프라인 · 토큰 없음' } : avail[p];
-        return `<button type="button" class="engine-opt ${state.engine[kind] === p ? 'on' : ''}" data-engine-id="${p}" ${a ? '' : 'disabled'}>
+        const on = state.engine[kind] === p;
+        return `<button type="button" class="engine-opt ${on ? 'on' : ''}" data-engine-id="${p}" aria-pressed="${on}" ${a ? '' : 'disabled'}>
           <b>${CLI_NAMES[p]}</b><small>${a ? esc(a.label) : '연결 필요'}</small></button>`;
       }).join('')}</div>`;
+    // The 15s session refresh would otherwise rebuild the buttons and drop keyboard focus.
+    if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
     box.onclick = (e) => {
       const b = e.target.closest('[data-engine-id]');
       if (!b || b.disabled) return;
-      state.engine[kind] = b.dataset.engineId;
+      state.chosen[kind] = b.dataset.engineId;
       renderEngines();
     };
   }
@@ -150,8 +185,8 @@ function renderEngines() {
 function renderPill() {
   const s = state.session;
   const dot = $('#connPill .dot');
-  const local = s?.isLocal ? ['claude', 'codex', 'gemini'].filter((p) => s.local?.[p]?.available) : [];
-  const bridge = s?.bridge?.connected ? ['claude', 'codex', 'gemini'].filter((p) => s.bridge.clis?.[p]?.available) : [];
+  const local = s?.isLocal ? CLIS.filter((p) => s.local?.[p]?.available) : [];
+  const bridge = s?.bridge?.connected ? CLIS.filter((p) => s.bridge.clis?.[p]?.available) : [];
   const all = [...new Set([...local, ...bridge])];
   dot.className = `dot ${all.length ? 'ok' : 'warn'}`;
   $('#connText').textContent = all.length ? `${all.map((p) => CLI_NAMES[p].replace(' CLI', '')).join(' · ')} 연결됨` : 'AI 미연결 · 기본 엔진';
@@ -176,14 +211,21 @@ function renderResults(box, entry) {
   box._entry = entry;
 }
 
+// [회사명]-style placeholders are for the user to fill in before pasting; make them stand out.
+const PLACEHOLDER = /\[[^[\]\n]{1,40}\]/g;
+const markPlaceholders = (escaped) => escaped.replace(PLACEHOLDER, (m) => `<mark class="ph">${m}</mark>`);
+
 function promptCard(p, i, historyId) {
+  const hasPlaceholder = PLACEHOLDER.test(p.prompt);
+  PLACEHOLDER.lastIndex = 0;
   return `<article class="result" data-index="${i}" data-history="${historyId || ''}">
     <div class="result-head">
       <span class="badge">${esc(targetName(p.target))}</span>${p.variant ? `<span class="badge alt">${esc(p.variant)}</span>` : ''}
       <h3>${esc(p.title)}</h3>
       <div class="actions"><button class="icon-btn" data-act="copy" type="button">복사</button><button class="icon-btn" data-act="save" type="button">☆ 저장</button></div>
     </div>
-    <pre>${esc(p.prompt)}</pre>
+    <pre>${markPlaceholders(esc(p.prompt))}</pre>
+    ${hasPlaceholder ? '<div class="ph-hint">✏️ 색칠된 [ ] 부분을 내 내용으로 바꾼 뒤 붙여넣으세요.</div>' : ''}
     ${p.why ? `<div class="why">${esc(p.why)}</div>` : ''}
   </article>`;
 }
@@ -202,7 +244,12 @@ document.addEventListener('click', async (e) => {
   if (!p) return;
   if (btn.dataset.act === 'copy') copyText(p.prompt);
   if (btn.dataset.act === 'save') {
-    await api('/api/library', { method: 'POST', body: { title: p.title, target: p.target, prompt: p.prompt, historyId: card.dataset.history || null } });
+    // One save per card: a double tap must not add the same prompt twice.
+    if (btn.disabled || btn.classList.contains('on')) return;
+    btn.disabled = true;
+    try {
+      await api('/api/library', { method: 'POST', body: { title: p.title, target: p.target, prompt: p.prompt, historyId: card.dataset.history || null } });
+    } catch (err) { btn.disabled = false; throw err; }
     btn.textContent = '★ 저장됨';
     btn.classList.add('on');
     toast('⭐ 저장함에 추가했습니다');
@@ -210,10 +257,23 @@ document.addEventListener('click', async (e) => {
   }
 });
 
+// Follows the job's long-poll. A phone locking its screen or a Wi-Fi blip must not abandon a
+// generation that keeps running (and spending tokens) on the server, so network errors are retried.
 async function waitJob(id, onTick) {
   let since = 0;
+  let failures = 0;
   for (;;) {
-    const job = await api(`/api/jobs/${id}?since=${since}`);
+    let job;
+    try {
+      job = await api(`/api/jobs/${id}?since=${since}`);
+      failures = 0;
+    } catch (e) {
+      if (e.status === 404) throw new Error('서버가 다시 시작되어 진행 중이던 생성이 취소되었습니다. 다시 생성하세요.');
+      if (!e.network || ++failures > 20) throw e;
+      onTick?.({ status: 'reconnecting' });
+      await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** failures, 10000)));
+      continue;
+    }
     since = job.updatedAt;
     onTick?.(job);
     if (job.status === 'done') return job.result;
@@ -240,20 +300,21 @@ async function submit(form, kind) {
       const msg = $('#loadMsg', box);
       if (msg && job.status === 'running') msg.textContent = job.via === 'bridge' ? `내 PC의 ${CLI_NAMES[engine]}가 작성 중…` : `${CLI_NAMES[engine]}가 작성 중…`;
       if (msg && job.status === 'queued' && job.via === 'bridge') msg.textContent = '내 PC 브리지로 전송하는 중…';
+      if (msg && job.status === 'reconnecting') msg.textContent = '연결이 끊겨 다시 연결하는 중… (생성은 계속 진행됩니다)';
     });
     renderResults(box, entry);
     try { localStorage.setItem('spm_engine', engine); } catch { /* storage blocked */ }
     toast('✨ 프롬프트 생성 완료 · 히스토리에 저장됨');
     refreshSession();
   } catch (err) {
-    const others = ['claude', 'codex', 'gemini', 'template'].filter((p) => p !== engine && (p === 'template' || engineAvailability(p)));
-    const loginHint = /auth|login|oauth|401|로그인/i.test(err.message) ? `<p class="muted">로그인이 만료된 것 같습니다. 터미널에서 <code>${esc(engine)}</code>를 실행해 다시 로그인한 뒤 시도하세요.</p>` : '';
-    box.innerHTML = `<div class="error-box"><b>생성하지 못했습니다</b><p>${esc(err.message)}</p>${loginHint}
+    const others = ENGINES.filter((p) => p !== engine && (p === 'template' || engineAvailability(p)));
+    const loginHint = /auth|login|oauth|401|로그인/i.test(err.message) ? `<p class="muted">로그인이 만료된 것 같습니다. 터미널에서 <code>${esc(LOGIN_CMD[engine] || engine)}</code>를 실행해 다시 로그인한 뒤 시도하세요.</p>` : '';
+    box.innerHTML = `<div class="error-box" role="alert"><b>생성하지 못했습니다</b><p>${esc(err.message)}</p>${loginHint}
       <div class="actions">${others.map((p) => `<button class="ghost small" type="button" data-retry="${p}">${CLI_NAMES[p]}로 다시 시도</button>`).join('')}</div></div>`;
     box.querySelector('.actions').onclick = (e) => {
       const b = e.target.closest('[data-retry]');
       if (!b) return;
-      state.engine[kind] = b.dataset.retry;
+      state.chosen[kind] = b.dataset.retry;
       renderEngines();
       submit(form, kind);
     };
@@ -382,15 +443,15 @@ function renderConnect() {
   const s = state.session;
   if (!s) return;
   $('#localDesc').innerHTML = s.isLocal
-    ? '서버를 실행 중인 이 PC에서 접속했습니다. 이 PC에 로그인된 CLI 계정을 바로 사용합니다.'
-    : '다른 PC에서 접속했기 때문에 서버 PC의 계정은 사용할 수 없습니다. 오른쪽에서 <b>내 PC</b>를 연결하세요.';
+    ? '서버를 실행 중인 이 PC에서 접속했습니다. 이 PC에 설치된 CLI를 이 PC의 로그인 계정으로 바로 사용합니다. (✅는 설치 여부이며, 로그인 상태는 생성할 때 확인됩니다)'
+    : '다른 기기에서 접속했기 때문에 서버 PC의 계정은 사용할 수 없습니다. <b>내 PC 연결</b>에서 내 컴퓨터의 CLI를 연결하거나, 토큰 없이 쓰는 <b>기본 엔진</b>을 사용하세요.';
   $('#localList').innerHTML = s.isLocal
-    ? ['claude', 'codex', 'gemini'].map((p) => `<li>${s.local?.[p]?.available ? '✅' : '❌'} <b>${CLI_NAMES[p]}</b><small>${esc(s.local?.[p]?.version || '설치/로그인 필요')}</small></li>`).join('')
+    ? CLIS.map((p) => `<li>${s.local?.[p]?.available ? '✅' : '❌'} <b>${CLI_NAMES[p]}</b><small>${esc(s.local?.[p]?.available ? `설치됨 · ${s.local[p].version}` : '설치되지 않음')}</small></li>`).join('')
     : '';
   $('#localRefresh').hidden = !s.isLocal;
   const b = s.bridge || {};
   $('#bridgeStatus').innerHTML = b.connected
-    ? `<div class="analysis"><span>🟢</span><div><b>${esc(b.hostname || '내 PC')}</b> 연결됨 · ${['claude', 'codex', 'gemini'].map((p) => `${b.clis?.[p]?.available ? '✅' : '❌'} ${p}`).join('  ')}</div></div>`
+    ? `<div class="analysis"><span>🟢</span><div><b>${esc(b.hostname || '내 PC')}</b> 연결됨 · ${CLIS.map((p) => `${b.clis?.[p]?.available ? '✅' : '❌'} ${p}`).join('  ')}</div></div>`
     : `<div class="analysis"><span>⚪</span><div>연결된 PC가 없습니다.</div></div>`;
   $('#unpairBtn').hidden = !b.connected;
   if (b.connected) { $('#pairBox').hidden = true; clearInterval(state.pairTimer); }
@@ -398,17 +459,22 @@ function renderConnect() {
 $('#localRefresh').addEventListener('click', async () => { toast('CLI를 다시 확인하는 중…'); await refreshSession(true); toast('확인 완료'); });
 $('#pairBtn').addEventListener('click', async () => {
   const { code } = await api('/api/bridge/code', { method: 'POST', body: {} });
-  const origin = location.origin;
-  const ps = `irm ${origin}/spm-bridge.mjs -OutFile spm-bridge.mjs; node spm-bridge.mjs --server ${origin} --code ${code}`;
-  const sh = `curl -fsSo spm-bridge.mjs ${origin}/spm-bridge.mjs && node spm-bridge.mjs --server ${origin} --code ${code}`;
+  // The bridge resolves "localhost" to IPv6 first on older Node, but the server listens on IPv4.
+  const origin = location.hostname === 'localhost' ? `${location.protocol}//127.0.0.1:${location.port}` : location.origin;
+  // Download into the temp folder (an admin shell starts in System32) and run only if the download worked,
+  // so a failed download never runs an old copy.
+  const ps = `$f = Join-Path $env:TEMP 'spm-bridge.mjs'; irm ${origin}/spm-bridge.mjs -OutFile $f; if ($?) { node $f --server ${origin} --code ${code} }`;
+  const sh = `f="\${TMPDIR:-/tmp}/spm-bridge.mjs"; curl -fsSo "$f" ${origin}/spm-bridge.mjs && node "$f" --server ${origin} --code ${code}`;
   const box = $('#pairBox');
   box.hidden = false;
   box.innerHTML = `<div>연결 코드 <span class="muted">(10분간 유효)</span></div><div class="pair-code">${code}</div>
     <div class="muted">Windows PowerShell</div><div class="cmd"><code>${esc(ps)}</code><button class="icon-btn" type="button" data-copy="${esc(ps)}">복사</button></div>
     <div class="muted">macOS / Linux 터미널</div><div class="cmd"><code>${esc(sh)}</code><button class="icon-btn" type="button" data-copy="${esc(sh)}">복사</button></div>
-    <div class="muted">실행하면 이 화면이 자동으로 '연결됨'으로 바뀝니다.</div>`;
+    <div class="muted">실행하면 이 화면이 자동으로 '연결됨'으로 바뀝니다. 휴대폰에서 코드를 만들고 내 PC에서 실행해도 이 휴대폰이 내 PC의 CLI로 생성합니다.</div>`;
   clearInterval(state.pairTimer);
-  state.pairTimer = setInterval(refreshSession, 3000);
+  // Watch for the bridge only while the code is valid (10 minutes).
+  const until = Date.now() + 10 * 60000;
+  state.pairTimer = setInterval(() => { if (Date.now() > until) clearInterval(state.pairTimer); else refreshSession(); }, 3000);
 });
 $('#pairBox').addEventListener('click', (e) => { const b = e.target.closest('[data-copy]'); if (b) copyText(b.dataset.copy); });
 $('#unpairBtn').addEventListener('click', async () => { await api('/api/bridge', { method: 'DELETE' }); toast('연결을 해제했습니다'); refreshSession(); });

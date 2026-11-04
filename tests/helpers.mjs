@@ -7,21 +7,37 @@ import { fileURLToPath } from 'node:url';
 
 export const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
-// Starts server.mjs on a random port with its own temporary data folder.
-export async function startServer() {
-  const port = 39200 + Math.floor(Math.random() * 700);
+// Starts server.mjs on a free port (PORT=0) with its own temporary data folder. `env` overrides variables;
+// a PATH override replaces the inherited one whatever its case (Windows has "Path").
+export async function startServer(env = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'spm-test-'));
-  const proc = spawn(process.execPath, [join(ROOT, 'server.mjs')], { env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', SPM_DATA_DIR: dataDir } });
-  await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('server did not start')), 10000);
-    proc.stdout.on('data', (d) => { if (String(d).includes('실행 중')) { clearTimeout(t); resolve(); } });
-    proc.on('exit', (c) => reject(new Error(`server exited ${c}`)));
-  });
+  const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !('PATH' in env && /^path$/i.test(k))));
+  const proc = spawn(process.execPath, [join(ROOT, 'server.mjs')], { env: { ...base, PORT: '0', HOST: '127.0.0.1', SPM_DATA_DIR: dataDir, ...env } });
+  let output = '';
+  proc.stdout.on('data', (d) => { output += d; });
+  proc.stderr.on('data', (d) => { output += d; });
+  const cleanup = async () => { proc.kill(); await rm(dataDir, { recursive: true, force: true }); };
+  let port;
+  try {
+    port = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('server did not start')), 10000);
+      proc.stdout.on('data', () => {
+        const m = output.match(/http:\/\/localhost:(\d+)/);
+        if (m) { clearTimeout(t); resolve(Number(m[1])); }
+      });
+      proc.on('exit', (c) => { clearTimeout(t); reject(new Error(`server exited ${c}`)); });
+    });
+  } catch (e) {
+    await cleanup();
+    throw new Error(`${e.message}\n${output}`);
+  }
   return {
     port,
     base: `http://127.0.0.1:${port}`,
     dataDir,
-    async stop() { proc.kill(); await rm(dataDir, { recursive: true, force: true }); },
+    alive: () => proc.exitCode === null,
+    logs: () => output,
+    stop: cleanup,
   };
 }
 
@@ -42,10 +58,11 @@ export function client(base) {
   };
 }
 
-// Follows a job's long-poll until it finishes (each poll waits up to 20s server-side).
-export async function waitJob(call, id, maxPolls = 20) {
+// Follows a job's long-poll (each poll waits up to 20s server-side) until it finishes or the deadline passes.
+export async function waitJob(call, id, deadlineMs = 25000) {
+  const until = Date.now() + deadlineMs;
   let since = 0;
-  for (let i = 0; i < maxPolls; i++) {
+  while (Date.now() < until) {
     const { json } = await call(`/api/jobs/${id}?since=${since}`);
     since = json.updatedAt;
     if (json.status === 'done' || json.status === 'error') return json;
